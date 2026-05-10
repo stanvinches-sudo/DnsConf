@@ -19,6 +19,10 @@ import static java.util.Objects.isNull;
 
 public abstract class HttpRequestSender {
 
+    private static final int TOO_MANY_REQUESTS = 429;
+    private static final int MAX_RATE_LIMIT_RETRIES = 20;
+    private static final long RATE_LIMIT_WAIT_MILLIS = 70_000L;
+
     private final Semaphore semaphore = new Semaphore(100);
 
     protected static final String GET = "GET";
@@ -66,27 +70,43 @@ public abstract class HttpRequestSender {
         } else {
             requestBody = HttpRequest.BodyPublishers.ofString(body.toJson());
         }
-        semaphore.acquire();
-        HttpRequest request = HttpRequest.newBuilder(uri)
-                .header(authHeaderName(), authHeaderValue())
-                .header("Content-Type", "application/json")
-                .method(method, requestBody)
-                .build();
-        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-        semaphore.release();
-        if (response.statusCode() > 299) {
-            DnsHttpError httpError = new DnsHttpError(response, body);
-            Log.fail(httpError.getMessage());
-            switch (response.statusCode()) {
-                case 401 -> react401();
-                case 403 -> react403();
-                case 404 -> react404(httpError);
-                default -> throw httpError;
+
+        for (int attempt = 0; attempt <= MAX_RATE_LIMIT_RETRIES; attempt++) {
+            HttpRequest request = HttpRequest.newBuilder(uri)
+                    .header(authHeaderName(), authHeaderValue())
+                    .header("Content-Type", "application/json")
+                    .method(method, requestBody)
+                    .build();
+
+            semaphore.acquire();
+            HttpResponse<String> response;
+            try {
+                response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            } finally {
+                semaphore.release();
             }
+
+            if (response.statusCode() == TOO_MANY_REQUESTS && attempt < MAX_RATE_LIMIT_RETRIES) {
+                Log.fail("NextDNS API rate limit reached. Waiting 70 seconds before retry...");
+                Thread.sleep(RATE_LIMIT_WAIT_MILLIS);
+                continue;
+            }
+
+            if (response.statusCode() > 299) {
+                DnsHttpError httpError = new DnsHttpError(response, body);
+                Log.fail(httpError.getMessage());
+                switch (response.statusCode()) {
+                    case 401 -> react401();
+                    case 403 -> react403();
+                    case 404 -> react404(httpError);
+                    default -> throw httpError;
+                }
+            }
+            if (response.body().isEmpty()) {
+                return null;
+            }
+            return jsonMapper.fromJson(response.body(), responseBody);
         }
-        if (response.body().isEmpty()) {
-            return null;
-        }
-        return jsonMapper.fromJson(response.body(), responseBody);
+        throw new IllegalStateException("Unexpected HTTP retry state");
     }
 }
